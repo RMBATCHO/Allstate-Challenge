@@ -1,0 +1,410 @@
+---
+title: "Allstate Purchase Prediction"
+author: "Rolande Sonya Mbatchou"
+date: "Thursday, September 11, 2014"
+output: html_document
+---
+
+
+**1. Sypnosis**
+-----------------
+
+Allstate Insurance Company has collected data on customer purchase of car insurance policy. The data included information about the customer, the car, and the quoted policy (including their puchased quote). The goal of our analysis was to predict correctly which 7 car insurance options a customer will buy. We had to select 7 coverage options (A, B, C, D, E, F, G), each with 2 to 4 possible values (i.e. 0,1,2), which totaled to 2304 possible combinations (ex: for customer 10000005, we predicted plan purchase: 0131104). Before building our prediction algorith, we transformed both the train and test data to obtain tidier datasets. We also performed exploratory plot analysis to capture patterns and correlations in the data. The baseline prediction with ~50% accuracy corresponded to customers buying the same insurance as their last viewed quote. Our goal was to build a model on top of this baseline. We constructed prediction algorithms for each of the 7 coverage options based on the assumption that customers will purchase a quote that is different than their last viewed quote. Since the given challenge was a classification problem, we used Random Forest / Cross Validation machine learning techniques to predict customer purchase for each of the 7 car insurance options, individually, which we later combined to get our final prediction methedology. We concluded that our prediction methedology could be a good fit for Allstate to determine the eventual car insurance option purchased in the shopping window.
+
+
+**2. Data Processing**
+------------------------
+
+```{r, echo=FALSE, results='hide'}
+setwd("C:/Users/rolande.mbatchou/Desktop/Other/Rolande Mbatchou/Data Scientist - Allstate/Kaggle - Claim Prediction Challenge") # File needs to be saved in working directory to reproduce our model.
+trainData <- read.csv("train.csv", header=TRUE)
+testData <- read.csv("test_v2.csv", header=TRUE)
+str(trainData)
+head(trainData)
+
+```
+
+In this section, we created a function, **tidyData**, that transformed both the train and test data to obtain tidier datasets. We generated a new variable to determine individual/family type, we combined the state variable into clusters, we applied certain rules to replace na values, we made transformation on the time and day variables, and we coerced the class type to factor for certain variables. 
+
+```{r}
+tidyData <- function(data){
+
+#1. Create a new variable to identify: young individual, adult individual, young couple, adult couple, family with child, and family.
+
+data$group_type <- ifelse(data$group_size > 2 & data$age_youngest >= 18, "family",
+                                  ifelse(data$group_size > 2 & data$age_youngest < 18, "family with child",
+                                         ifelse(data$group_size == 2 & data$age_oldest < 25, "young couple",
+                                                ifelse(data$group_size == 2 & data$age_oldest >= 25, "adult couple",
+                                                       ifelse(data$group_size == 1 & data$age_oldest < 25, "young individual",
+                                                              ifelse(data$group_size == 1 & data$age_oldest >= 25, "adult individual", "non identified"))))))     
+
+#2. Group state based on state minimum insurance requirement for bodily injury limit (low, normal, high) (i.e. if bodily injury limit =<15: 'low'; if >=30: 'high'; else: 'normal') (see <http://personalinsure.about.com/cs/vehicleratings/a/blautominimum.htm>): 
+
+data$state <- as.character(data$state)
+data$state_group <- ifelse(data$state == "AK" | data$state == "ME" | data$state == "MD" | data$state == "MN" | data$state == "NC" | data$state == "TX" | data$state == "WI", "high limit", 
+                           ifelse(data$state == "AZ" | data$state == "CA" | data$state == "DE" | data$state == "FL" | data$state == "LA" | data$state == "NJ" | data$state == "NV" | data$state == "OH" | data$state == "PA", "low limit", "normal limit"))
+
+#3. Replace na values
+
+#a. Replace missing values for risk factor by risk factor average value, given the same age_youngest and car_age variables. In fact, we assumed that the age of the youngest individual and the age of the car will have potential impact on someone's risk factor):
+
+risk_factorAvg <- aggregate(risk_factor ~ age_youngest + car_age, data, mean)
+risk_factorAvg$risk_factor <- ceiling(risk_factorAvg$risk_factor)
+combRisk <- merge(data, risk_factorAvg, by=c("age_youngest", "car_age"), suffixes=c("init", "avg"))
+data$risk_factor <- ifelse(is.na(data$risk_factor), combRisk$risk_factoravg[match(data$customer_ID, combRisk$customer_ID)], data$risk_factor)
+
+#b. For the remaining na's for unusual cases where ind age is 70 and car age 41 with no possible risk factor match -- > replace with risk factor average for someone that age.
+
+risk_factorAvgOth <- aggregate(risk_factor ~ age_youngest, data, mean)
+risk_factorAvgOth$risk_factor <- ceiling(risk_factorAvgOth$risk_factor)
+combRiskOth <- merge(data, risk_factorAvgOth, by="age_youngest", suffixes=c("init", "avg"))       
+data$risk_factor <- ifelse(is.na(data$risk_factor), combRiskOth$risk_factoravg[match(data$customer_ID, combRiskOth$customer_ID)], data$risk_factor)
+
+#c. Replace na's in the C_previous variable with current values in C variable:
+
+data$C_previous <- ifelse(is.na(data$C_previous), data$C, data$C_previous)
+
+#d. Set to 0 all na's in the duration_previous variable:
+
+data$duration_previous <- ifelse(is.na(data$duration_previous),0, data$duration_previous)
+
+#4. Convert time variable to decimal form and then group time as: morning, afternoon, evening, and unusual times.
+
+data$time <- sapply(strsplit(as.character(data$time),":"),
+                    function(x) { 
+                            x <- as.numeric(x)
+                            round(x[1]+x[2]/60)})
+data$day_time <- ifelse(data$time >= 6 & data$time < 12, "morning",
+                        ifelse(data$time >= 12 & data$time < 17, "afternoon",
+                               ifelse(data$time >= 17 & data$time < 21, "evening", "unusual")))
+
+#5. Group day variable as: weekend and weekday.
+
+data$day_type <- ifelse(data$day == 5 | data$day == 6, "weekend", "weekday")
+
+#6. Coerce class type to factor for the following variables:
+
+data$group_type <- as.factor(data$group_type) 
+data$state_group <- as.factor(data$state_group)
+data$risk_factor <- as.factor(data$risk_factor)
+data$day_time <- as.factor(data$day_time)
+data$day_type <- as.factor(data$day_type)
+data$record_type <- as.factor(data$record_type)
+data$A <- as.factor(data$A)
+data$B <- as.factor(data$B)
+data$C <- as.factor(data$C)
+data$D <- as.factor(data$D)
+data$E <- as.factor(data$E)
+data$F <- as.factor(data$F)
+data$G <- as.factor(data$G)
+data$C_previous <- as.factor(data$C_previous)
+data$state <- as.factor(data$state)
+
+# Return final transformed dataset:
+
+return(data)
+
+} 
+
+# Transform both train and test datasets, and preview newly transform sets:
+
+train <- tidyData(trainData)
+test <- tidyData(testData)
+
+```
+
+
+**3. Exploratory Analysis**
+-----------------------------
+
+***Correlation Analysis***
+
+From calculating correlation coefficients, we observed that insurance option "A" and "F" have a positive correletion: .53. We also realized that insurance option C has a high correlation with option "D" and "C_previous". The latter correlation was logical as a customer will have a higher probability of buying the options he/she purchased in the past than any other coverage. 
+
+***Exploratory Analysis -- Coverage Options Frequency***
+
+We observed, from the histograms below, that for insurance option C,F,G, values 4, 3, 4 have the lowest frequency of being selected, respectively. In addition, we detected that for insurance option A and D, values 1 and 2 have a higher frequency, respectively.
+
+```{r, echo=FALSE}
+library(caret)
+par(mfrow=c(2,3), mar=c(4,4,1,1))
+barplot(prop.table(table(train$C)), col="pink", xlab="Frequency Option - C")
+barplot(prop.table(table(train$F)), col="green", xlab="Frequency Option - F")
+barplot(prop.table(table(train$G)), col="yellow", xlab="Frequency Option - G")
+barplot(prop.table(table(train$A)), col="blue", xlab="Frequency Option - A")
+barplot(prop.table(table(train$D)), col="red", xlab="Frequency Option - D")
+
+```
+
+***Exploratory Analysis -- State Group***
+
+We created clusters for states based on their car insurance requirements for bodily injuries <http://personalinsure.about.com/cs/vehicleratings/a/blautominimum.htm>. We observed, from the map below, that few states such as California have lower limit required and also few states like Minnesota and Wisconsin have higher limit required. We conducted further analysis on these states, and we saw from the histogram below that for state with low requirements, they have a higher frequency than normal for risk factor 1 (lowest risk factor). 
+
+```{r, echo=FALSE}
+library(maps)
+all_states <- map_data("state")
+
+all_states$state_group <- ifelse(all_states$region == "maine" | all_states$region == "maryland" | all_states$region == "minnesota" | all_states$region == "north carolina" | all_states$region == "texas" | all_states$region == "wisconsin", "high limit",
+                           ifelse(all_states$region == "arizona" | all_states$region == "california" | all_states$region == "delaware" | all_states$region == "florida" | all_states$region == "louisiana" | all_states$region == "new jersey" | all_states$region == "nevada" | all_states$region == "ohio" | all_states$region == "pennsylvania", "low limit", "normal limit"))
+
+all_states$state_group <- as.factor(all_states$state_group)
+
+p <- ggplot()
+p <- p + geom_polygon(data=all_states, aes(x=long, y=lat, group = group, fill=state_group),colour="white") + theme_bw() + labs(fill = "Limit Requirements",title = "States Limit Requirements for Bodily Injury Insurance", x="", y="")+ scale_x_continuous(breaks=c()) + scale_y_continuous(breaks=c())+ theme(panel.border = element_blank())
+p
+
+subdata1 <- train[train$risk_factor == 1,]
+qplot(state_group, data=subdata1) + labs(fill ="",title = "State Group for Risk Factor 1" ) 
+
+```
+
+***Exploratory Analysis -- Group Type***
+
+In our data cleaning, we partitioned the data based on 6 categories, which we named group_type: young individual, adult individual, young couple, adult couple, family with child, and family. We observed, from the histograms below, some patterns that were different for individual groups compared to overall set. In fact, family with child tend to have a higher frequency for option value O in group A than the average (value 1). In addition, for young couples and young individuals, we detected a higher frequency for option value 1 in group A than the average (value 3). 
+
+
+```{r, echo=FALSE}
+par(mfrow=c(1,3), mar=c(4,4,1,1))
+
+subdata2 <- train[train$group_type == "family with child",]
+barplot(prop.table(table(subdata2$A)), col="green", xlab="Family with child - Coverage A")
+
+subdata3 <- train[train$group_type == "young couple",]
+barplot(prop.table(table(subdata3$C)), col="red", xlab="Young Couple - Coverage C")
+
+subdata4 <- train[train$group_type == "young individual",]
+barplot(prop.table(table(subdata4$C)), col="blue", xlab="Young Individual - Coverage C")
+
+```
+
+
+**4. Model Fit**
+------------------
+ 
+***Note***
+
+We did not actually run our prediction models due to memory issue but, in this section, we described the methedology we will have used to build our model (All the R codes are shown).
+
+***Baseline Prediction***
+
+We established a baseline prediction for the test data set based on the last viewed quote. In fact, we assumed that a customer will most likely buy the last quote he or she viewed rather than a former one or one that he or she has never seen. The models we built going forward use this baseline prediction as a base to construct a better model and increase our accuracy rate. 
+
+```{r, echo=FALSE}
+subTest <- test[!duplicated(test$customer_ID, fromLast = TRUE), ]
+subTest$Comb <- with(subTest, paste0(A,B,C,D,E,F,G))
+basePred <- data.frame(subTest$customer_ID, subTest$Comb)
+names(basePred) <- c("customer_ID", "plan")
+write.csv(basePred, "basePred.csv")
+head(basePred)
+
+```
+
+***Model Fit - Part 1***
+
+The first step we took was to check how well the quotes recorded (before the purchase point) predicted the actual purchased quote, for each individual coverages. We partitioned the train set in two sets: train: quotes excluding the one at purchase point; test: only the purchased quote. Then, we built our Random Forest model and predicted the individual insurance options from the other variables in the dataset. 
+
+```{r, eval=FALSE}
+
+fit <- function(col_index){
+        
+        #Partition the data        
+        trainInd <- train[train$record_type ==0,]; testInd <- train[train$record_type ==1, ]
+        
+        #create a list of seed, here change the seed for each resampling
+        set.seed(123)
+        seeds <- vector(mode = "list", length = 11)
+        for(i in 1:10) seeds[[i]]<- sample.int(n=1000, 3)
+        seeds[[11]]<-sample.int(1000, 1) 
+
+        #My Control List
+        ctrl <- trainControl(method = "rf", seeds=seeds, index=createFolds(trainInd[, col_index]))
+
+        #Build  the model with Train controls and predictions
+        modFit <- train(trainInd[, col_index] ~ ., data = trainInd, method = "rf", trControl = ctrl)
+        pred1 <- predict(modFit, testInd) 
+
+        # Get the accuracy rate for prediction vs. test set:
+        accuracy <- confusionMatrix(testInd[, col_index], pred1)$overall[1]
+        accuracy <- data.frame(accuracy)
+
+  return(accuracy)
+}
+
+```
+
+
+```{r, eval=FALSE}
+accuracyA <- fit(col_index=18)
+accuracyB <- fit(col_index=19)
+accuracyC <- fit(col_index=20)
+accuracyD <- fit(col_index=21)
+accuracyE <- fit(col_index=22)
+accuracyF <- fit(col_index=23)
+accuracyG <- fit(col_index=24)
+
+finalAccuracy <- data.frame(accuracyA, accuracyB, accuracyC, accuracyD, accuracyE, accuracyF, accuracyG)
+names(finalAccuracy) <- c("accuracyA", "accuracyB", "accuracyC", "accuracyD", "accuracyE", "accuracyF", "accuracyG")
+finalAccuracy
+
+```
+
+***Model Fit - Part 2***
+
+The second step we took was to use the same model fit from Part 1. to predict the test set, based on the last quote dataset only. In fact, the test set was truncated with less history than the train set. However, we were not informed how the data were transformed. Thus, we assumed that the last quote viewed, in the test set, was the best outcome measure to use to predict future purchases. 
+
+```{r, eval=FALSE}
+finalFit <- function(col_index){
+        
+        #Filter test set with last viewed quote data only
+        trainInd <- train
+        testInd <-  test[!duplicated(test$customer_ID, fromLast = TRUE), ]
+        
+        #create a list of seed, here change the seed for each resampling
+        set.seed(123)
+        seeds <- vector(mode = "list", length = 11)
+        for(i in 1:10) seeds[[i]]<- sample.int(n=1000, 3)
+        seeds[[11]]<-sample.int(1000, 1) 
+
+        #My Control List
+        ctrl <- trainControl(method = "rf", seeds=seeds, index=createFolds(trainInd[, col_index]))
+
+        #Build  the model with Train controls and predictions
+        modFit <- train(trainInd[, col_index] ~ ., data = trainInd, method = "rf", trControl = ctrl)
+        pred2 <- predict(modFit, testInd) 
+
+  return(pred2)
+}
+
+```
+
+```{r, eval=FALSE}
+predA <- finalFit(col_index=18)
+predB <- finalFit(col_index=19)
+predC <- finalFit(col_index=20)
+predD <- finalFit(col_index=21)
+predE <- finalFit(col_index=22)
+predF <- finalFit(col_index=23)
+predG <- finalFit(col_index=24)
+
+totalpred <- data.frame(predA, predB, predC, predD, predE, predF, predG)
+names(totalpred) <- c("A", "B", "C", "D", "E", "F", "G")
+totalpred$Comb <- with(totalpred, paste0(A,B,C,D,E,F,G))
+pred2 <- data.frame(testSub$customer_ID, totalpred$Comb)
+names(pred2) <- c("customer_ID", "plan")
+write.csv(pred2, "pred2.csv")
+head(pred2)
+
+```
+        
+        
+***Initial Prediction Methedology***
+
+Third, we decided to create an algorithm for the test set that will allow us to combine our baseline prediction with the one obtained in Part 2 so that we could obtain a stronger prediction model. The algorithm worked as follow, for each individual insurance options: 
+
+if(first viewed quote == last viewed quote, select last viewed quote (baseline prediction),
+        else if(first viewed quote != last viewed quote, select predicted quote (Random Forest prediction))) 
+
+```{r, eval=FALSE}
+firstQuote <- test[!duplicated(test$customer_ID, fromLast = FALSE), ]
+lastQuote <- test[!duplicated(test$customer_ID, fromLast = TRUE), ]
+
+final$test <- ifelse(traindbaks$test == "test", test, test)
+
+finalPred <- data.frame(testSub$customer_ID, testSub$group_type, firstQuote$A,firstQuote$B, firstQuote$C, firstQuote$D, firstQuote$E, firstQuote$F, firstQuote$G, lastQuote$A, lastQuote$B, lastQuote$C, lastQuote$D, lastQuote$E, lastQuote$F, lastQuote$G, predA,predB, predC, predD, predE, predF, predG)
+
+names(finalPred) <- c("customer_ID", "group_type", "firstQuoteA", "firstQuoteB", "firstQuoteC", "firstQuoteD", "firstQuoteE", "firstQuoteF", "firstQuoteG", "lastQuoteA", "lastQuoteB", "lastQuoteC", "lastQuoteD", "lastQuoteE", "lastQuoteF", "lastQuoteG","predA" ,"predB", "predC", "predD", "predE", "predF", "predG")
+                      
+finalPred$finalPredA <- ifelse(finalPred$firstQuoteA == finalPred$lastQuoteA, finalPred$lastQuoteA, finalPred$predA)
+finalPred$finalPredB <- ifelse(finalPred$firstQuoteB == finalPred$lastQuoteB, finalPred$lastQuoteB, finalPred$predB)
+finalPred$finalPredC <- ifelse(finalPred$firstQuoteC == finalPred$lastQuoteC, finalPred$lastQuoteC, finalPred$predC)
+finalPred$finalPredD <- ifelse(finalPred$firstQuoteD == finalPred$lastQuoteD, finalPred$lastQuoteD, finalPred$predD)
+finalPred$finalPredE <- ifelse(finalPred$firstQuoteE == finalPred$lastQuoteE, finalPred$lastQuoteE, finalPred$predE)
+finalPred$finalPredF <- ifelse(finalPred$firstQuoteF == finalPred$lastQuoteF, finalPred$lastQuoteF, finalPred$predF)
+finalPred$finalPredG <- ifelse(finalPred$firstQuoteG == finalPred$lastQuoteG, finalPred$lastQuoteG, finalPred$predG)
+
+#Final Prediction
+finalPred$Comb <- with(finalPred, paste0(finalPredA,finalPredB,finalPredC,finalPredD,finalPredE,finalPredF,finalPredG))
+pred3 <- data.frame(finalPred$customer_ID, finalPred$Comb)
+names(pred3) <- c("customer_ID", "plan")
+write.csv(pred3, "pred3.csv") 
+head(pred3)
+
+```        
+
+
+***Final Prediction Methedology***
+
+Finally, to perfect our prediction methedology, we looked back at our exploratory analysis and used some of the insight we obtained to enhance our prediction. We use 3 main facts:
+
+**Fact 1:  Family with child tend to have a higher frequency for option value O in group A than the average (value 1).**
+
+**Fact 2: Young couples have a higher frequency for option value 1 in group A than the average (value 3).** 
+
+**Fact 3: Young individuals have a higher frequency for option value 1 in group A than the average (value 3).**
+ 
+We built our algorithm as follow, for each individual insurance options: 
+
+ifelse(first viewed quote == last viewed quote, select last viewed quote (baseline prediction),
+ifelse(first viewed quote != last viewed quote,
+        ifelse(groupt_type == "family with child" AND predicted quote != 1(avg value for that group), select value O,
+        ifelse(groupt_type == "young couple" AND predicted quote != 3(avg value for that group), select value 1,
+        ifelse(groupt_type == "young individual" AND predicted quote != 3(avg value for that group), select value 1,select predicted quote)))))
+
+```{r, eval=FALSE}
+#Predict A
+finalPred$finalPredA <- ifelse(finalPred$firstQuoteA == finalPred$lastQuoteA, finalPred$lastQuoteA, 
+                               ifelse(finalPred$firstQuoteA != finalPred$lastQuoteA,
+                                      ifelse(finalPred$groupt_type == "family with child" & finalPred$predA != 1, int(0),
+                                            ifelse(finalPred$groupt_type == "young couple" & finalPred$predA != 3, int(1), 
+                                                   ifelse(finalPred$groupt_type == "young individual" & finalPred$predA != 3, int(1), finalPred$predA)))))
+
+#Predict B
+finalPred$finalPredB <- ifelse(finalPred$firstQuoteB == finalPred$lastQuoteB, finalPred$lastQuoteB, 
+                               ifelse(finalPred$firstQuoteB != finalPred$lastQuoteB,
+                                      ifelse(finalPred$groupt_type == "family with child" & finalPred$PredB != 1, int(0),
+                                            ifelse(finalPred$groupt_type == "young couple" & finalPred$PredB != 3, int(1), 
+                                                   ifelse(finalPred$groupt_type == "young individual" & finalPred$PredB != 3, int(1), finalPred$PredB)))))
+
+#Predict C
+finalPred$finalPredC <- ifelse(finalPred$firstQuoteC == finalPred$lastQuoteC, finalPred$lastQuoteC, 
+                               ifelse(finalPred$firstQuoteC != finalPred$lastQuoteC,
+                                      ifelse(finalPred$groupt_type == "family with child" & finalPred$PredC != 1, int(0),
+                                            ifelse(finalPred$groupt_type == "young couple" & finalPred$PredC != 3, int(1), 
+                                                   ifelse(finalPred$groupt_type == "young individual" & finalPred$PredC != 3, int(1), finalPred$PredC)))))
+
+#Predict D
+finalPred$finalPredD <- ifelse(finalPred$firstQuoteD == finalPred$lastQuoteD, finalPred$lastQuoteD, 
+                               ifelse(finalPred$firstQuoteD != finalPred$lastQuoteD,
+                                      ifelse(finalPred$groupt_type == "family with child" & finalPred$PredD != 1, int(0),
+                                            ifelse(finalPred$groupt_type == "young couple" & finalPred$PredD != 3, int(1), 
+                                                   ifelse(finalPred$groupt_type == "young individual" & finalPred$PredD != 3, int(1), finalPred$PredD)))))
+
+#Predict E
+finalPred$finalPredE <- ifelse(finalPred$firstQuoteE == finalPred$lastQuoteE, finalPred$lastQuoteE, 
+                               ifelse(finalPred$firstQuoteE != finalPred$lastQuoteE,
+                                      ifelse(finalPred$groupt_type == "family with child" & finalPred$PredE != 1, int(0),
+                                            ifelse(finalPred$groupt_type == "young couple" & finalPred$PredE != 3, int(1), 
+                                                   ifelse(finalPred$groupt_type == "young individual" & finalPred$PredE != 3, int(1), finalPred$PredE)))))
+
+#Predict F
+finalPred$finalPredF <- ifelse(finalPred$firstQuoteF == finalPred$lastQuoteF, finalPred$lastQuoteF, 
+                               ifelse(finalPred$firstQuoteF != finalPred$lastQuoteF,
+                                      ifelse(finalPred$groupt_type == "family with child" & finalPred$PredF != 1, int(0),
+                                            ifelse(finalPred$groupt_type == "young couple" & finalPred$PredF != 3, int(1), 
+                                                   ifelse(finalPred$groupt_type == "young individual" & finalPred$PredF != 3, int(1), finalPred$PredF)))))
+
+#Predict G
+finalPred$finalPredG <- ifelse(finalPred$firstQuoteG == finalPred$lastQuoteG, finalPred$lastQuoteG,
+                               ifelse(finalPred$firstQuoteG != finalPred$lastQuoteG,
+                                      ifelse(finalPred$groupt_type == "family with child" & finalPred$PredG != 1, int(0),
+                                            ifelse(finalPred$groupt_type == "young couple" & finalPred$PredG != 3, int(1), 
+                                                   ifelse(finalPred$groupt_type == "young individual" & finalPred$PredG != 3, int(1), finalPred$PredG)))))
+
+#Final Prediction
+finalPred$Comb <- with(finalPred, paste0(finalPredA,finalPredB,finalPredC,finalPredD,finalPredE,finalPredF,finalPredG))
+pred4 <- data.frame(finalPred$customer_ID, finalPred$Comb)
+names(pred4) <- c("customer_ID", "plan")
+write.csv(pred4, "pred4.csv") 
+head(pred4)
+
+```        
